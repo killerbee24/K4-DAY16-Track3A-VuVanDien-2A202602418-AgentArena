@@ -13,8 +13,8 @@ WHAT YOU GET FOR FREE
 =====================
 
 **The trace gate passes out of the box.** `run()` emits `agent_start`,
-one `model_call` per turn (with the tokens and the model's raw output
-text the scorer needs), and `agent_end`; `arena/tools.py` emits its own
+one `model_call` per turn (with the tokens and the model's canonicalised
+client output the scorer needs), and `agent_end`; `arena/tools.py` emits its own
 `tool_call` events. Keep using the harness and `Trace.validate` says
 `(True, "")` without you doing anything. Bypass it — call the model
 directly, hand-write JSONL — and the gate fails, which zeroes the entry.
@@ -53,8 +53,9 @@ produces no report at all, silently, and only on the unlucky seeds.
 TWO THINGS THIS AGENT DOES ON PURPOSE, AND WHY
 ==============================================
 
-1. `before_model` is applied to a COPY of the history, and only the raw
-   response and the raw observation are appended back. So a layer that
+1. `before_model` is applied to a DEEP COPY of the history, and only the
+   response actually acted on and the resulting observation are appended
+   back. So a layer that
    appends a one-turn nudge (`budget_policy`) nudges for one turn instead
    of forever.
 2. `tools.submit()` is called directly, NOT through `wrap_tool_call`.
@@ -104,11 +105,13 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+from copy import deepcopy
 import re
 from dataclasses import dataclass, field
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
+    ModelResponse,
     TOOL_ERROR_PREFIX,
     parse_output,
 )
@@ -281,31 +284,87 @@ ARENA_SYSTEM_PROMPT_REAL = real_model_system_prompt()
 #: output is three orders of magnitude below this.
 MAX_OUTPUT_TEXT_CHARS = 60_000
 
+#: A model call must never create a trace record with an empty
+#: ``output_text``.  The frozen runner uses the same honest marker: it is
+#: non-empty for the trace gate, but deliberately parses as nothing.
+EMPTY_OUTPUT_SENTINEL = "[ARENA-EMPTY-MODEL-OUTPUT]"
+
 
 def _canonicalise(text: str) -> str:
     """Rewrite a real endpoint's FINAL into the shape `parse_output` wants.
 
-    Delegates to `arena.scorer._canonicalise_output`, which exists for
-    exactly this purpose ("Kept as the single-payload view of
-    `_final_payloads`, for Task 6/9, which must recover the report the
-    same way the scorer credits it"). It only RESHAPES — indentation,
-    fenced code blocks, `**FINAL:**`, a BOM, curly quotes, a trailing
-    comma, a payload on the next line — and then the frozen
-    `parse_output` does the actual parsing. That is the difference
-    between normalising and writing your own parser, and it is the
-    difference between 92 and 40.
+    Uses the frozen runner's `normalise_output`, the exact transformation
+    applied before scored provenance is stamped. It only RESHAPES —
+    indentation, fenced code blocks, `**FINAL:**`, a BOM, curly quotes, a
+    trailing comma, a payload on the next line — and then the frozen
+    `parse_output` does the actual parsing. That is the difference between
+    normalising and writing a friendlier parser of our own.
 
-    Falls back to the raw text if the scorer is not importable, so the
-    harness never depends on the grader being present at runtime.
+    Older bundles fall back to the scorer's canonicaliser and finally to
+    the raw text, so the harness remains usable outside the scored runner.
     """
+    if not isinstance(text, str):
+        return ""
+
+    # The frozen runner owns the canonical form stamped into ``model_call``.
+    # Reusing it here keeps the direct-agent path (used heavily in tests and
+    # local debugging) identical to the scored path.  Import lazily to avoid
+    # a module cycle: ``arena.runner`` constructs ``ReActAgent`` lazily too.
     try:
-        from arena.scorer import _canonicalise_output
-    except Exception:  # pragma: no cover - the scorer ships with the lab
-        return text
+        from arena.runner import normalise_output
+
+        return normalise_output(text)
+    except Exception:
+        # Older arena bundles may not expose ``normalise_output``.  Their
+        # scorer canonicaliser is still preferable to accepting only the
+        # narrow wire format.
+        try:
+            from arena.scorer import _canonicalise_output
+
+            return _canonicalise_output(text)
+        except Exception:  # pragma: no cover - defensive compatibility
+            return text
+
+
+def _clamp_output_text(text: str, limit: int = MAX_OUTPUT_TEXT_CHARS) -> str:
+    """Bound a trace payload without cutting a trailing FINAL in half."""
     try:
-        return _canonicalise_output(text)
-    except Exception:  # pragma: no cover - defensive only
-        return text
+        from arena.runner import clamp_output_text
+
+        return clamp_output_text(text, limit=limit)
+    except Exception:
+        if len(text) <= limit:
+            return text
+
+        # Compatibility fallback for an older runner.  Prefer the last
+        # canonical FINAL when it fits; otherwise a simple head clamp is the
+        # only honest representation available.
+        marker = text.rfind("\n" + _FINAL_MARKER)
+        if marker >= 0:
+            final = text[marker + 1:]
+            if len(final) < limit:
+                head = text[: max(0, limit - len(final) - 1)]
+                return head + "\n" + final
+        return text[:limit]
+
+
+def _message_snapshot(messages: list[dict]) -> list[dict]:
+    """Deep-copy canonical history before student middleware receives it."""
+    snapshot = deepcopy(messages)
+    if not isinstance(snapshot, list) or not all(
+        isinstance(message, dict) for message in snapshot
+    ):
+        raise TypeError("before_model must receive and return a list of message dicts")
+    return snapshot
+
+
+def _validated_messages(messages) -> list[dict]:
+    """Fail at the faulty hook instead of much later inside a model client."""
+    if not isinstance(messages, list) or not all(
+        isinstance(message, dict) for message in messages
+    ):
+        raise TypeError("before_model must return a list of message dicts")
+    return messages
 
 
 def _is_placeholder(value) -> bool:
@@ -517,7 +576,15 @@ class ReActAgent:
         for step in range(self.max_steps):
             ctx.step = step
 
-            outbound = self.middleware.before_model(ctx, list(ctx.messages))
+            # A shallow list copy is not enough: a layer could mutate a
+            # message dict in place and silently rewrite the canonical
+            # history (including the original question).  Give the hook an
+            # isolated snapshot, then validate its public contract before a
+            # provider gets a cryptic payload error.
+            outbound = self.middleware.before_model(
+                ctx, _message_snapshot(ctx.messages)
+            )
+            outbound = _validated_messages(outbound)
             response = self.middleware.wrap_model_call(ctx, self._call_model)(outbound)
             response = self.middleware.after_model(ctx, response)
 
@@ -591,12 +658,17 @@ class ReActAgent:
         submitted if the run ends without a real FINAL, so a guard can
         only buy a turn, never lose a report.
         """
-        parsed = parse_output(_canonicalise(text))
+        normalised = _canonicalise(text)
+        parsed = parse_output(normalised)
         if parsed.kind != "final":
             return parsed
 
         if _is_report_payload(parsed.final):
-            action = _action_under_final(text)
+            # Inspect the same canonical text that produced ``parsed``.
+            # Otherwise a bold/lowercase/indented FINAL followed by a valid
+            # ACTION is accepted too early simply because the raw marker did
+            # not literally start with ``FINAL:``.
+            action = _action_under_final(normalised)
             if action is None or self._final_deferrals >= MAX_FINAL_DEFERRALS:
                 return parsed
             self._final_deferrals += 1
@@ -607,10 +679,7 @@ class ReActAgent:
             key in parsed.final for key in REPORT_KEYS
         ):
             self._refused_final = parsed.final
-        # Strict, NOT canonicalised: normalisation is what resurrects a
-        # non-canonical marker such as `final: {}` in the first place, and
-        # this path exists precisely to look underneath one.
-        return parse_output(_without_quoted_finals(text))
+        return parse_output(_without_quoted_finals(normalised))
 
     # -- the model -----------------------------------------------------
 
@@ -624,22 +693,41 @@ class ReActAgent:
         stamped from their return value would prove nothing at all.
         """
         response = self.model.complete(messages)
+        raw_text = getattr(response, "text", None)
+        if not isinstance(raw_text, str):
+            raise TypeError(
+                "model.complete must return a ModelResponse whose .text is a str; "
+                f"got {type(raw_text).__name__}"
+            )
+
+        normalised = _canonicalise(raw_text)
+        prompt_tokens = _as_nonnegative_int(getattr(response, "prompt_tokens", 0))
+        completion_tokens = _as_nonnegative_int(
+            getattr(response, "completion_tokens", 0)
+        )
         # A frozen runner may take over `model_call` emission (it is the
         # only way to make the record unforgeable). It announces that by
         # setting `emits_model_call = True` on the model object.
         if not getattr(self.model, "emits_model_call", False):
-            text = response.text if isinstance(response.text, str) else str(response.text)
+            stamped = _clamp_output_text(normalised) or EMPTY_OUTPUT_SENTINEL
             self.trace.emit(
                 "model_call",
-                prompt_tokens=response.prompt_tokens,
-                completion_tokens=response.completion_tokens,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
                 # str is immutable — `Trace.emit` stores a reference to
                 # whatever it is handed, so a mutable would let later code
                 # rewrite history.
-                output_text=text[:MAX_OUTPUT_TEXT_CHARS],
+                output_text=stamped,
                 step=self.last_context.step if self.last_context else 0,
             )
-        return response
+        # The parser and the scorer must see the same canonical string.
+        # Rebuilding the frozen value object also prevents a custom model
+        # from smuggling mutable response state through later hooks.
+        return ModelResponse(
+            text=normalised,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+        )
 
     # -- the tools -----------------------------------------------------
 
@@ -656,10 +744,25 @@ class ReActAgent:
             )
 
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        args = parsed.args if isinstance(parsed.args, dict) else {}
+        result = call(parsed.tool, dict(args))
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
-        return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+        if not isinstance(result.ok, bool):
+            return f"{TOOL_ERROR_PREFIX} layer trả về cờ ok không hợp lệ cho {parsed.tool}"
+        if result.ok:
+            content = getattr(result, "content", None)
+            if not isinstance(content, str):
+                return (
+                    f"{TOOL_ERROR_PREFIX} layer trả về content không hợp lệ "
+                    f"cho {parsed.tool}"
+                )
+            return content
+
+        error = _as_text(getattr(result, "error", None)).strip()
+        if not error:
+            error = f"tool {parsed.tool} thất bại nhưng không cung cấp lý do"
+        return f"{TOOL_ERROR_PREFIX} {error}"
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""
@@ -677,10 +780,22 @@ def _as_text(value) -> str:
     return value if isinstance(value, str) else ("" if value is None else str(value))
 
 
+def _as_nonnegative_int(value) -> int:
+    """Trace-safe integer coercion for token counts from custom clients."""
+    if isinstance(value, bool):
+        return 0
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _as_k(value) -> int:
+    if isinstance(value, bool):
+        return 5
     try:
         k = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return 5
     return max(1, min(MAX_SEARCH_K, k))
 
